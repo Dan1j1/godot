@@ -37,6 +37,7 @@ TEST_FORCE_LINK(test_file_access_patched)
 #include "core/io/file_access.h"
 #include "core/io/file_access_pack.h"
 #include "core/io/file_access_patched.h"
+#include "core/os/os.h"
 #include "tests/test_utils.h"
 
 namespace TestFileAccessPatched {
@@ -312,6 +313,70 @@ TEST_CASE("[FileAccessPatched] close resets the state and file_exists delegates"
 	patched->close();
 	CHECK_FALSE(patched->is_open());
 	CHECK_EQ(patched->get_error(), Error::OK);
+}
+
+// Benchmark, skipped by default. Run with: --test-case="*Benchmark*" --no-skip
+TEST_CASE("[FileAccessPatched][Benchmark] Apply patch timing" * doctest::skip(true)) {
+	PackedDataScope scope;
+
+	int scale = 100;
+	String scale_env = OS::get_singleton()->get_environment("DELTA_BENCH_SCALE");
+	if (!scale_env.is_empty()) {
+		scale = MAX(1, scale_env.to_int());
+	}
+	const int rounds = scale < 10 ? 1 : 5;
+
+	const int sizes[] = { 64, 4096, 65536 };
+	const int base_iterations[] = { 2000, 1000, 200 };
+
+	print_line("PATCHED_BENCHMARK size_bytes apply_us_per_call");
+
+	for (int s = 0; s < 3; s++) {
+		const int size = sizes[s];
+		const int iterations = MAX(1, base_iterations[s] * scale / 100);
+
+		Vector<uint8_t> old_data;
+		old_data.resize(size);
+		uint32_t state = 12345;
+		for (int i = 0; i < size; i++) {
+			state = state * 1664525u + 1013904223u;
+			old_data.write[i] = (((state >> 24) % 16) == 0) ? (uint8_t)(state >> 16) : (uint8_t)(i % 61);
+		}
+		Vector<uint8_t> new_data = old_data;
+		for (int i = 0; i < size; i += MAX(1, size / 16)) {
+			new_data.write[i] ^= 0x5A;
+		}
+
+		Vector<uint8_t> delta;
+		REQUIRE_EQ(DeltaEncoding::encode_delta(old_data, new_data, delta), Error::OK);
+
+		const String vpath = String("res://godot_test_patched/bench_") + itos(size) + ".bin";
+		String pack_path = register_patch(vpath, delta);
+
+		uint64_t sink = 0;
+		double best = 1e30;
+		for (int r = 0; r < rounds; r++) {
+			uint64_t start = OS::get_singleton()->get_ticks_usec();
+			for (int i = 0; i < iterations; i++) {
+				// A fresh old file each time, because reading advances its position.
+				Ref<FakeOldFile> old_file = memnew(FakeOldFile(vpath, old_data));
+				Ref<FileAccessPatched> patched;
+				patched.instantiate();
+				patched->open_custom(old_file);
+				sink += patched->get_length(); // Triggers _apply_patch().
+			}
+			uint64_t end = OS::get_singleton()->get_ticks_usec();
+			double per_call = double(end - start) / double(iterations);
+			if (per_call < best) {
+				best = per_call;
+			}
+		}
+
+		CHECK_EQ(sink, uint64_t(size) * uint64_t(iterations) * uint64_t(rounds));
+		print_line(vformat("PATCHED_BENCHMARK %d %s", size, String::num(best, 2)));
+
+		DirAccess::remove_absolute(pack_path);
+	}
 }
 
 } // namespace TestFileAccessPatched
